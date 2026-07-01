@@ -1,12 +1,34 @@
 ChangeLog
 =========
 
-unreleased: Version 0.18.0
+03-06-2026: Version 0.18.1
+--------------------------
+
+Bugfixes:
+
+- Fix an ``AssertionError`` in stack-size computation when a single exception
+  region is split into multiple ``TryBegin`` instances sharing one handler (as
+  produced by bytecode-rewriting tools that wrap a whole function body in a
+  single handler). ``TryBegin``/``TryEnd`` are now matched on the handler block
+  rather than on ``TryBegin`` identity.
+
+03-06-2026: Version 0.18.0
 --------------------------
 
 - drop support for Python 3.9 and 3.10 PR #180
 - Replace string literal type annotations with postponed evaluation using
   ``from __future__ import annotations`` PR #191
+- multiple performance improvements
+  PRs #172, #193, #196, #194, #197, #198, #199, #200, #201,
+  #202, #203
+
+Breaking changes:
+
+- ``BasicBlock``, ``Bytecode``, and ``ConcreteBytecode`` now validate inserted
+  instructions at insertion time (``append``, ``extend``, ``insert``,
+  ``__setitem__``) rather than during iteration. Code that relied on catching
+  ``ValueError`` from ``list(block)`` or ``for instr in block:`` must wrap the
+  insertion call instead. PR #199
 
 Bugfixes:
 

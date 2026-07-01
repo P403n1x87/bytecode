@@ -37,6 +37,7 @@ from bytecode.instr import (
     DUAL_ARG_OPCODES_SINGLE_OPS,
     EXTENDEDARG_OPCODE,
     FORMAT_VALUE_OPS,
+    HAS_JUMP,
     INTRINSIC,
     INTRINSIC_1OP,
     INTRINSIC_2OP,
@@ -193,10 +194,36 @@ class ConcreteInstr(BaseInstr[int]):
         new = object.__new__(cls)
         new._name = name
         new._opcode = opcode
+        new._is_jump = opcode in HAS_JUMP
         new._arg = arg
         new._location = location
         new._extended_args = None
         new._size = 2
+        return new
+
+    @classmethod
+    def _from_trusted(
+        cls: Type[T],
+        name: str,
+        opcode: int,
+        arg: int,
+        location: Optional[InstrLocation],
+    ) -> T:
+        """Fast path for concrete_instructions: skip validation, compute size from arg."""
+        new = object.__new__(cls)
+        new._name = name
+        new._opcode = opcode
+        new._is_jump = opcode in HAS_JUMP
+        new._arg = arg
+        new._location = location
+        new._extended_args = None
+        size = 2
+        if arg is not UNSET:
+            _arg = arg
+            while _arg > 0xFF:
+                size += 2
+                _arg >>= 8
+        new._size = size
         return new
 
     @classmethod
@@ -305,15 +332,7 @@ class ConcreteBytecode(_bytecode._BaseBytecodeList[Union[ConcreteInstr, SetLinen
         self.names = list(names)
         self.varnames = list(varnames)
         self.exception_table = exception_table or []
-        for instr in instructions:
-            self._check_instr(instr)
         self.extend(instructions)
-
-    def __iter__(self) -> Iterator[Union[ConcreteInstr, SetLineno]]:
-        instructions = super().__iter__()
-        for instr in instructions:
-            self._check_instr(instr)
-            yield instr
 
     def _check_instr(self, instr: Any) -> None:
         if not isinstance(instr, (ConcreteInstr, SetLineno)):
@@ -364,13 +383,20 @@ class ConcreteBytecode(_bytecode._BaseBytecodeList[Union[ConcreteInstr, SetLinen
         pos_iter: Iterator[
             Tuple[Optional[int], Optional[int], Optional[int], Optional[int]]
         ] = iter(code.co_positions())
+        _last_pos: Optional[
+            Tuple[Optional[int], Optional[int], Optional[int], Optional[int]]
+        ] = None
+        _last_loc: Optional[InstrLocation] = None
         for offset in range(0, len(bc), 2):
             op = bc[offset]
             arg = bc[offset + 1] if opcode_has_argument(op) else UNSET
             pos = next(pos_iter, None)
-            loc: Optional[InstrLocation] = (
-                InstrLocation._from_tuple(*pos) if pos is not None else None
-            )
+            if pos == _last_pos:
+                loc: Optional[InstrLocation] = _last_loc
+            else:
+                loc = InstrLocation._from_tuple(*pos) if pos is not None else None
+                _last_pos = pos
+                _last_loc = loc
             instructions.append(ConcreteInstr._from_opcode(opname[op], op, arg, loc))
 
         bytecode = ConcreteBytecode()
@@ -468,10 +494,8 @@ class ConcreteBytecode(_bytecode._BaseBytecodeList[Union[ConcreteInstr, SetLinen
         return (1 << 7) + (code << 3) + (size - 1 if size <= 8 else 7)
 
     def _pack_location(
-        self, size: int, lineno: int, location: Optional[InstrLocation]
-    ) -> bytearray:
-        packed = bytearray()
-
+        self, buf: bytearray, size: int, lineno: int, location: Optional[InstrLocation]
+    ) -> None:
         l_lineno: Optional[int]
         # The location was not set so we infer a line.
         if location is None:
@@ -491,7 +515,7 @@ class ConcreteBytecode(_bytecode._BaseBytecodeList[Union[ConcreteInstr, SetLinen
 
         # We have no location information so the code is 15
         if l_lineno is None:
-            packed.append(self._pack_location_header(15, size))
+            buf.append(self._pack_location_header(15, size))
 
         # No column info, code 13
         elif col_offset is None:
@@ -500,7 +524,7 @@ class ConcreteBytecode(_bytecode._BaseBytecodeList[Union[ConcreteInstr, SetLinen
                     "An instruction cannot have no column offset and span "
                     f"multiple lines (lineno: {l_lineno}, end lineno: {end_lineno}"
                 )
-            packed.extend(
+            buf.extend(
                 (
                     self._pack_location_header(13, size),
                     *self._encode_location_svarint(l_lineno - lineno),
@@ -518,7 +542,7 @@ class ConcreteBytecode(_bytecode._BaseBytecodeList[Union[ConcreteInstr, SetLinen
                 and col_offset < 72
                 and (end_col_offset - col_offset) <= 15
             ):
-                packed.extend(
+                buf.extend(
                     (
                         self._pack_location_header(col_offset // 8, size),
                         ((col_offset % 8) << 4) + (end_col_offset - col_offset),
@@ -532,7 +556,7 @@ class ConcreteBytecode(_bytecode._BaseBytecodeList[Union[ConcreteInstr, SetLinen
                 and col_offset < 256
                 and end_col_offset < 256
             ):
-                packed.extend(
+                buf.extend(
                     (
                         self._pack_location_header(10 + l_lineno - lineno, size),
                         col_offset,
@@ -544,7 +568,7 @@ class ConcreteBytecode(_bytecode._BaseBytecodeList[Union[ConcreteInstr, SetLinen
             else:
                 assert end_lineno is not None
 
-                packed.extend(
+                buf.extend(
                     (
                         self._pack_location_header(14, size),
                         *self._encode_location_svarint(l_lineno - lineno),
@@ -556,11 +580,9 @@ class ConcreteBytecode(_bytecode._BaseBytecodeList[Union[ConcreteInstr, SetLinen
                     )
                 )
 
-        return packed
-
     def _push_locations(
         self,
-        locations: List[bytearray],
+        buf: bytearray,
         size: int,
         lineno: int,
         location: InstrLocation,
@@ -572,7 +594,7 @@ class ConcreteBytecode(_bytecode._BaseBytecodeList[Union[ConcreteInstr, SetLinen
         # elements. We recompute each time since in practice we will
         # rarely loop.
         while True:
-            locations.append(self._pack_location(size, lineno, location))
+            self._pack_location(buf, size, lineno, location)
             # Update the lineno since if we need more than one entry the
             # reference for the delta of the lineno change
             lineno = location.lineno if location.lineno is not None else lineno
@@ -590,7 +612,7 @@ class ConcreteBytecode(_bytecode._BaseBytecodeList[Union[ConcreteInstr, SetLinen
         if not linenos:
             return b""
 
-        locations: List[bytearray] = []
+        buf = bytearray()
 
         iter_in = iter(linenos)
 
@@ -611,15 +633,15 @@ class ConcreteBytecode(_bytecode._BaseBytecodeList[Union[ConcreteInstr, SetLinen
                 size += i_size
                 continue
 
-            lineno = self._push_locations(locations, size, lineno, old_location)
+            lineno = self._push_locations(buf, size, lineno, old_location)
 
             size = i_size
             old_location = location
 
         # Pack the line of the last instruction.
-        self._push_locations(locations, size, lineno, old_location)
+        self._push_locations(buf, size, lineno, old_location)
 
-        return b"".join(locations)
+        return bytes(buf)
 
     @staticmethod
     def _remove_extended_args(
@@ -790,16 +812,19 @@ class ConcreteBytecode(_bytecode._BaseBytecodeList[Union[ConcreteInstr, SetLinen
         c_instructions = self[:]
         self._remove_extended_args(c_instructions)
 
-        # Find jump targets
+        # Find jump targets; stash (size, jump_target) to avoid recomputing in the main loop
         jump_targets: Set[int] = set()
+        _instr_props: List[Tuple[int, Optional[int]]] = []
         offset = 0
         for c_instr in c_instructions:
             if isinstance(c_instr, SetLineno):
                 continue
+            size = c_instr.size
             target = c_instr.get_jump_target(offset)
+            _instr_props.append((size, target))
             if target is not None:
                 jump_targets.add(target)
-            offset += c_instr.size // 2
+            offset += size // 2
 
         # On 3.11+ we need to also look at the exception table for jump targets
         for ex_entry in self.exception_table:
@@ -847,6 +872,7 @@ class ConcreteBytecode(_bytecode._BaseBytecodeList[Union[ConcreteInstr, SetLinen
         else:
             locals_lookup = self.varnames
 
+        _props_iter = iter(_instr_props)
         for lineno, c_instr in self._normalize_lineno(
             c_instructions, self.first_lineno
         ):
@@ -872,8 +898,7 @@ class ConcreteBytecode(_bytecode._BaseBytecodeList[Union[ConcreteInstr, SetLinen
                     tb_instrs[entry] = tb_instr
                     instructions.append(tb_instr)
 
-            jump_target = c_instr.get_jump_target(offset)
-            size = c_instr.size
+            size, jump_target = next(_props_iter)
             # If an instruction uses extended args, those appear before the instruction
             # causing the instruction to appear at offset that accounts for extended
             # args. So we first update the offset to account for extended args, then
@@ -1036,7 +1061,9 @@ class _ConvertBytecodeToConcrete:
         self.consts_indices: dict[bytes | Tuple[type, int], int] = {}
         self.consts_list: list[Any] = []
         self.names: list[str] = []
+        self.names_map: dict[str, int] = {}
         self.varnames: list[str] = []
+        self.varnames_map: dict[str, int] = {}
 
     def add_const(self, value: Any) -> int:
         key = const_key(value)
@@ -1047,13 +1074,20 @@ class _ConvertBytecodeToConcrete:
         self.consts_list.append(value)
         return index
 
-    @staticmethod
-    def add(names: list[str], name: str) -> int:
-        try:
-            index = names.index(name)
-        except ValueError:
-            index = len(names)
-            names.append(name)
+    def add_name(self, name: str) -> int:
+        index = self.names_map.get(name)
+        if index is None:
+            index = len(self.names)
+            self.names_map[name] = index
+            self.names.append(name)
+        return index
+
+    def add_varname(self, name: str) -> int:
+        index = self.varnames_map.get(name)
+        if index is None:
+            index = len(self.varnames)
+            self.varnames_map[name] = index
+            self.varnames.append(name)
         return index
 
     def concrete_instructions(self) -> None:
@@ -1074,7 +1108,7 @@ class _ConvertBytecodeToConcrete:
                     assert isinstance(binstr.arg, tuple)
                     for parg in binstr.arg:
                         assert isinstance(parg, str)
-                        self.add(self.varnames, parg)
+                        self.add_varname(parg)
 
         # We use None as a sentinel to ensure caches for the last instruction are
         # properly generated.
@@ -1141,12 +1175,14 @@ class _ConvertBytecodeToConcrete:
 
             assert isinstance(instr, Instr)
 
-            if instr.location is not UNSET and instr.location is not None:
-                location = instr.location
+            # Access private slots directly — avoids property descriptor overhead on
+            # every iteration; safe because instr is a validated Instr at this point.
+            if instr._location is not UNSET and instr._location is not None:
+                location = instr._location
 
-            instr_name = instr.name
+            instr_name = instr._name
             opcode = instr._opcode
-            arg = instr.arg
+            arg = instr._arg
             is_jump = False
             if isinstance(arg, Label):
                 label = arg
@@ -1158,8 +1194,8 @@ class _ConvertBytecodeToConcrete:
             elif opcode in HAS_LOCAL:
                 if opcode in DUAL_ARG_OPCODES:
                     _arg2 = cast(Tuple[str, str], arg)
-                    arg1_index = self.add(self.varnames, _arg2[0])
-                    arg2_index = self.add(self.varnames, _arg2[1])
+                    arg1_index = self.add_varname(_arg2[0])
+                    arg2_index = self.add_varname(_arg2[1])
                     if arg1_index > 16 or arg2_index > 16:
                         n1, n2 = DUAL_ARG_OPCODES_SINGLE_OPS[opcode]
                         c_instr = ConcreteInstr(n1, arg1_index, location=location)
@@ -1176,7 +1212,7 @@ class _ConvertBytecodeToConcrete:
                     c_arg = self.bytecode.freevars.index(arg.name)
                 else:
                     assert isinstance(arg, str)
-                    c_arg = self.add(self.varnames, arg)
+                    c_arg = self.add_varname(arg)
             elif opcode in HAS_NAME:
                 if opcode in BITFLAG_OPCODES:
                     assert (
@@ -1185,7 +1221,7 @@ class _ConvertBytecodeToConcrete:
                         and isinstance(arg[0], bool)
                     ), arg
                     if isinstance(arg[1], str):
-                        index = self.add(self.names, arg[1])
+                        index = self.add_name(arg[1])
                     elif isinstance(arg, FormatValue):
                         index = int(arg)
                     else:
@@ -1193,11 +1229,11 @@ class _ConvertBytecodeToConcrete:
                     c_arg = int(arg[0]) + (index << 1)
                 elif opcode in BITFLAG2_OPCODES:
                     _arg3 = cast(tuple[bool, bool, str], arg)
-                    index = self.add(self.names, _arg3[2])
+                    index = self.add_name(_arg3[2])
                     c_arg = int(_arg3[0]) + 2 * int(_arg3[1]) + (index << 2)
                 else:
                     assert isinstance(arg, str), f"Got {arg}, expected a str"
-                    c_arg = self.add(self.names, arg)
+                    c_arg = self.add_name(arg)
             elif opcode in HAS_FREE:
                 if isinstance(arg, CellVar):
                     cell_instrs.append(len(self.instructions))
@@ -1230,7 +1266,7 @@ class _ConvertBytecodeToConcrete:
                 c_arg = arg
 
             # The above should have performed all the necessary conversion
-            c_instr = ConcreteInstr(instr_name, c_arg, location=location)
+            c_instr = ConcreteInstr._from_trusted(instr_name, opcode, c_arg, location)
             if is_jump:
                 self.jumps.append((len(self.instructions), label, c_instr))
 
@@ -1342,7 +1378,8 @@ class _ConvertBytecodeToConcrete:
         if first_const is not UNSET:
             self.add_const(first_const)
 
-        self.varnames.extend(self.bytecode.argnames)
+        for name in self.bytecode.argnames:
+            self.add_varname(name)
 
         self.concrete_instructions()
         for _ in range(0, compute_jumps_passes):

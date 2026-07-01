@@ -17,6 +17,8 @@ from bytecode import (
     Instr,
     Label,
     SetLineno,
+    TryBegin,
+    TryEnd,
     dump_bytecode,
 )
 from bytecode.instr import CommonConstant
@@ -60,28 +62,55 @@ def disassemble(
 
 
 class BlockTests(unittest.TestCase):
-    def test_iter_invalid_types(self):
-        # Labels are not allowed in basic blocks
+    def test_inserting_invalid_types(self):
+        # Labels are not allowed in basic blocks — caught at insertion time
         block = BasicBlock()
-        block.append(Label())
         with self.assertRaises(ValueError):
-            list(block)
+            block.append(Label())
         with self.assertRaises(ValueError):
-            block.legalize(1)
+            block.extend([Label()])
+        with self.assertRaises(ValueError):
+            block.insert(0, Label())
+        block.append(Instr("NOP"))
+        with self.assertRaises(ValueError):
+            block[0] = Label()
+        with self.assertRaises(ValueError):
+            block[:] = [Label()]
+
+        # Valid types are accepted via all insertion methods
+        nop = Instr("NOP")
+        block = BasicBlock()
+        block.append(nop)
+        self.assertEqual(block[0], nop)
+        block.insert(0, nop)
+        self.assertEqual(len(block), 2)
+        block.extend([nop])
+        self.assertEqual(len(block), 3)
+        block[0] = nop
+        block[:] = [nop]
+        self.assertEqual(len(block), 1)
 
         # Only one jump allowed and only at the end
         block = BasicBlock()
         block2 = BasicBlock()
-        block.extend(
-            [
-                Instr("JUMP_FORWARD", block2),
-                Instr("NOP"),
-            ]
-        )
+        # caught at extend time (within batch)
         with self.assertRaises(ValueError):
-            list(block)
+            block.extend(
+                [
+                    Instr("JUMP_FORWARD", block2),
+                    Instr("NOP"),
+                ]
+            )
+        # caught at append time (cross-boundary)
+        block = BasicBlock()
+        block.append(Instr("JUMP_FORWARD", block2))
         with self.assertRaises(ValueError):
-            block.legalize(1)
+            block.append(Instr("NOP"))
+        # caught at extend time (cross-boundary)
+        block = BasicBlock()
+        block.append(Instr("JUMP_FORWARD", block2))
+        with self.assertRaises(ValueError):
+            block.extend([Instr("NOP")])
 
         # jump target must be a BasicBlock
         block = BasicBlock()
@@ -91,6 +120,12 @@ class BlockTests(unittest.TestCase):
             list(block)
         with self.assertRaises(ValueError):
             block.legalize(1)
+
+        # TryBegin target must be a BasicBlock
+        block = BasicBlock()
+        block.extend([TryBegin(label, push_lasti=False)])
+        with self.assertRaises(ValueError):
+            list(block)
 
     def test_slice(self):
         block = BasicBlock([Instr("NOP")])
@@ -874,6 +909,78 @@ class CFGStacksizeComputationTests(TestCase):
         with contextlib.redirect_stdout(io.StringIO()) as stdout:
             self.assertEqual(test([], name=None), -1)
             self.assertEqual(stdout.getvalue(), "second finally\nfirst finally\n")
+
+    def test_stack_size_computation_shared_handler_split_regions(self):
+        # Regression test for an assertion failure in the stack-size
+        # computation. A bytecode-rewriting transform (e.g. an instrumentation
+        # tool) may wrap a whole function body in a single exception handler
+        # whose coverage is split around the body's own try blocks, so that the
+        # regions never nest but all share the *same* handler block. A single
+        # logical region then maps to several TryBegin instances.
+        #
+        # When such a region is exited through a forward jump (here the branch
+        # inside the first handler body), the jump target block is reached both
+        # by fall-through and by the jump, and ends up carrying one TryBegin
+        # copy as ``pending_try_begin`` while its own leading TryEnd references
+        # a *different* copy of the same region. Matching TryEnd against the
+        # current TryBegin by identity then failed to close the region, leaving
+        # it spuriously open and tripping ``assert self._current_try_begin is
+        # None`` at the following TryBegin. Matching must be done on the handler
+        # (the TryBegin target block) instead.
+        if sys.version_info < (3, 11):
+            self.skipTest("exception tables (TryBegin/TryEnd) require 3.11+")
+
+        def trigger(d, x):  # pragma: no cover
+            try:
+                d["a"]
+            except KeyError:
+                if x:  # a branch *inside* the handler body
+                    pass
+                else:
+                    d["b"] = 1
+            try:  # ... followed by another try block
+                del d["c"]
+            except KeyError:
+                pass
+            return 99
+
+        bc = Bytecode.from_code(trigger.__code__)
+
+        # Wrap the whole body in one shared handler, splitting the covering
+        # region around the body's existing try blocks.
+        except_label = Label()
+        first_tb = last_tb = TryBegin(except_label, push_lasti=True)
+        i = 0
+        while i < len(bc):
+            instr = bc[i]
+            if isinstance(instr, TryBegin) and last_tb is not None:
+                bc.insert(i, TryEnd(last_tb))
+                last_tb = None
+                i += 1
+            elif isinstance(instr, TryEnd):
+                j = i + 1
+                while j < len(bc) and not isinstance(bc[j], TryBegin):
+                    if isinstance(bc[j], Instr):
+                        last_tb = TryBegin(except_label, push_lasti=True)
+                        bc.insert(i + 1, last_tb)
+                        break
+                    j += 1
+                i += 1
+            i += 1
+        bc.insert(0, first_tb)
+        bc.append(TryEnd(last_tb))
+        bc.append(except_label)
+        bc.append(Instr("PUSH_EXC_INFO"))
+        bc.append(Instr("RERAISE", 2))
+
+        cfg = ControlFlowGraph.from_bytecode(bc)
+        # Used to raise AssertionError on 3.12.
+        cfg.compute_stacksize()
+
+        # The rewritten code object is valid and still runs correctly.
+        trigger.__code__ = cfg.to_code()
+        self.assertEqual(trigger({}, True), 99)
+        self.assertEqual(trigger({"c": 1}, False), 99)
 
     def test_stack_size_with_dead_code(self):
         # Simply demonstrate more directly the previously mentioned issue.
