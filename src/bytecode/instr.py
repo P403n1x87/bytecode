@@ -39,7 +39,9 @@ BITFLAG_OPCODES: Final[set[int]] = (
 )
 
 BITFLAG2_OPCODES: Final[set[int]] = (
-    {_opcode.opmap["LOAD_SUPER_ATTR"]} if PY312 else set()
+    {_opcode.opmap["LOAD_SUPER_ATTR"], _opcode.opmap["IMPORT_NAME"]}
+    if PY315
+    else ({_opcode.opmap["LOAD_SUPER_ATTR"]} if PY312 else set())
 )
 
 # Binary op opcode which has a dedicated arg

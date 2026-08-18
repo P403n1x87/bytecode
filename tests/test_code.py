@@ -84,6 +84,15 @@ class CodeTests(TestCase):
             function=True,
         )
 
+    def test_import(self):
+        self.check(
+            """
+            import os
+            import os.path as osp
+            from os import path
+        """
+        )
+
     def test_async_gen(self):
         self.check(
             """
