@@ -721,7 +721,7 @@ class BaseInstr(Generic[A]):
         name: str,
         arg: A = UNSET,  # type: ignore
         *,
-        lineno: int | None | _UNSET = UNSET,
+        lineno: int | _UNSET | None = UNSET,
         location: Optional[InstrLocation] = None,
     ) -> None:
         self._set(name, arg)
