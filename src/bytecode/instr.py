@@ -271,13 +271,15 @@ class CommonConstant(enum.IntEnum):
     BUILTIN_TUPLE = 2
     BUILTIN_ALL = 3
     BUILTIN_ANY = 4
-    BUILTIN_LIST = 5
-    BUILTIN_SET = 6
-    CONSTANT_NONE = 7
-    CONSTANT_EMPTY_STR = 8
-    CONSTANT_TRUE = 9
-    CONSTANT_FALSE = 10
-    CONSTANT_MINUS_ONE = 11
+
+    if PY315:
+        BUILTIN_LIST = 5
+        BUILTIN_SET = 6
+        CONSTANT_NONE = 7
+        CONSTANT_EMPTY_STR = 8
+        CONSTANT_TRUE = 9
+        CONSTANT_FALSE = 10
+        CONSTANT_MINUS_ONE = 11
 
 
 # This make type checking happy but means it won't catch attempt to manipulate an unset
@@ -434,10 +436,8 @@ STATIC_STACK_EFFECTS: Final[dict[int, tuple[int, int]]] = {
         "DUP_TOP_TWO": (-2, 4),
         "GET_LEN": (-1, 2),
         "GET_ITER": (-1, 2) if PY315 else (-1, 1),
-        "GET_YIELD_FROM_ITER": (
-            -1,
-            1,
-        ),  # removed in 3.15, filtered by if k in _opcode.opmap
+        # removed in 3.15, filtered by if k in _opcode.opmap
+        "GET_YIELD_FROM_ITER": (-1, 1),
         "GET_AWAITABLE": (-1, 1),
         "GET_AITER": (-1, 1),
         "GET_ANEXT": (-1, 2),
@@ -520,10 +520,12 @@ DYNAMIC_STACK_EFFECTS: Final[
         "MAP_ADD": lambda effect, arg, jump: (-arg, arg - 2),
         "FORMAT_VALUE": lambda effect, arg, jump: (effect - 1, 1),
         # FOR_ITER needs TOS to be an iterator, hence a prerequisite of 1 on the stack
-        # In 3.15, GET_ITER pushes (iter, null_or_index); FOR_ITER always pushes the
-        # next value (+1). When exhausted it jumps to END_FOR (which pops it) then
-        # POP_ITER cleans up (iter, null_or_index). Matches dis.stack_effect = 1 always.
-        "FOR_ITER": (lambda __effect, __arg, __jump: (0, 1))
+        # In 3.15, GET_ITER pushes (iter, null_or_index) as two stack slots, so
+        # FOR_ITER now requires both on the stack (-2) and always pushes them back
+        # plus one more slot (+3): the next value when continuing, or a marker
+        # consumed by END_FOR when exhausted before POP_ITER cleans up (iter,
+        # null_or_index). Net effect is +1 in both cases, matching dis.stack_effect.
+        "FOR_ITER": (lambda __effect, __arg, __jump: (-2, 3))
         if PY315
         else (lambda effect, __arg, jump: (effect, 0) if jump else (-1, 2)),
         "BUILD_INTERPOLATION": lambda effect, arg, jump: (-(2 + (arg & 1)), 1),
